@@ -129,7 +129,7 @@ predictor = UR5eACTRealtimeInference(
 唯一需要调用的推理接口：
 
 ```python
-next_tcp_pose = predictor.predict_next_tcp_pose(
+next_command = predictor.predict_next_tcp_pose(
     camera_1_rgb,
     camera_2_rgb,
     current_tcp_pose,
@@ -149,7 +149,8 @@ gripper_opening_current: np.ndarray, shape=(2,), [gripper_opening, gripper_curre
 输出：
 
 ```text
-next_tcp_pose: np.ndarray, shape=(6,), [x, y, z, rx, ry, rz]
+next_command: np.ndarray, shape=(7,), [x, y, z, rx, ry, rz, gripper_opening]
+gripper_opening 会被裁剪到 [0, 1]
 ```
 
 最小接入示例：
@@ -163,6 +164,7 @@ predictor = UR5eACTRealtimeInference(
     inference_interval_s=0.05,
     max_pos_delta=0.005,
     max_rot_delta=0.03,
+    max_gripper_delta=0.08,
 )
 
 while True:
@@ -171,16 +173,17 @@ while True:
     current_tcp_pose = read_ur_tcp_pose()
     gripper_state = np.array([read_gripper_opening(), read_gripper_current()])
 
-    next_tcp_pose = predictor.predict_next_tcp_pose(
+    next_command = predictor.predict_next_tcp_pose(
         camera_1_rgb,
         camera_2_rgb,
         current_tcp_pose,
         gripper_state,
     )
-    send_ur_target_tcp_pose(next_tcp_pose)
+    send_ur_target_tcp_pose(next_command[:6])
+    send_gripper_opening(next_command[6])
 ```
 
-脚本内部会把 ACT 输出的 6 维 TCP 增量通过 `scripts/ur_action_to_pose.py` 转成下一步 UR TCP Pose。默认旋转模式是 `relative-rotvec`，和数据转换脚本保持一致。
+脚本内部会把 ACT 输出的前 6 维 TCP 增量通过 `scripts/ur_action_to_pose.py` 转成下一步 UR TCP Pose，第 7 维会按当前夹钳开度加上网络预测的夹钳开度增量，并裁剪到 `[0, 1]`。默认旋转模式是 `relative-rotvec`，和数据转换脚本保持一致。
 
 ## 接真实 UR5e
 

@@ -4,7 +4,8 @@
 This module intentionally does not contain a mock backend or robot SDK glue.
 Create one ``UR5eACTRealtimeInference`` instance in your UR5e control program,
 then call ``predict_next_tcp_pose`` with the latest two RGB camera frames and
-robot state.
+robot state. The method returns a 7D command:
+``[x, y, z, rx, ry, rz, gripper_opening]``.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ class UR5eACTRealtimeInference:
             policy_path="outputs/train/ur5e_act_a6000",
             inference_interval_s=0.05,
         )
-        next_tcp_pose = predictor.predict_next_tcp_pose(
+        next_command = predictor.predict_next_tcp_pose(
             camera_1_rgb,
             camera_2_rgb,
             current_tcp_pose,
@@ -50,6 +51,7 @@ class UR5eACTRealtimeInference:
         rotation_delta_mode: str = "relative-rotvec",
         max_pos_delta: float | None = 0.015,
         max_rot_delta: float | None = 0.08,
+        max_gripper_delta: float | None = 0.08,
         camera_keys: tuple[str, str] = (
             "observation.images.camera_1",
             "observation.images.camera_2",
@@ -67,6 +69,7 @@ class UR5eACTRealtimeInference:
                 default matches ``scripts/convert_ur5e_to_lerobot.py``.
             max_pos_delta: Optional safety clamp for dx/dy/dz in meters.
             max_rot_delta: Optional safety clamp for rotvec delta norm in radians.
+            max_gripper_delta: Optional safety clamp for gripper opening delta.
             camera_keys: LeRobot camera feature keys corresponding to the two
                 ndarray image inputs.
         """
@@ -80,6 +83,7 @@ class UR5eACTRealtimeInference:
         self.rotation_delta_mode = rotation_delta_mode
         self.max_pos_delta = max_pos_delta
         self.max_rot_delta = max_rot_delta
+        self.max_gripper_delta = max_gripper_delta
         self.camera_keys = camera_keys
         self._last_inference_time: float | None = None
 
@@ -96,7 +100,7 @@ class UR5eACTRealtimeInference:
         current_tcp_pose: np.ndarray,
         gripper_opening_current: np.ndarray,
     ) -> np.ndarray:
-        """Predict the next UR TCP pose.
+        """Predict the next UR TCP pose and gripper opening.
 
         Args:
             camera_1_image: RGB image ndarray from camera 1, HWC uint8 or float.
@@ -105,8 +109,9 @@ class UR5eACTRealtimeInference:
             gripper_opening_current: ``[gripper_opening, gripper_current]``.
 
         Returns:
-            Next TCP pose as ``np.ndarray`` with shape ``(6,)``:
-            ``[x, y, z, rx, ry, rz]``.
+            Next command as ``np.ndarray`` with shape ``(7,)``:
+            ``[x, y, z, rx, ry, rz, gripper_opening]``.
+            The gripper opening is clipped to ``[0, 1]``.
         """
 
         self._wait_for_interval()
@@ -128,14 +133,19 @@ class UR5eACTRealtimeInference:
             action = self.postprocessor(normalized_action)
 
         action_np = np.asarray(action.squeeze(0), dtype=np.float64)
-        action_np = self._clamp_pose_action(action_np)
+        action_np = self._clamp_action(action_np)
         next_tcp_pose = apply_pose_delta(
             current_tcp_pose,
             action_np[:6],
             rotation_delta_mode=self.rotation_delta_mode,
         )
+        next_gripper_opening = np.clip(
+            gripper_opening_current[0] + action_np[6],
+            0.0,
+            1.0,
+        )
         self._last_inference_time = time.perf_counter()
-        return np.asarray(next_tcp_pose, dtype=np.float64)
+        return np.asarray([*next_tcp_pose, next_gripper_opening], dtype=np.float64)
 
     def _wait_for_interval(self) -> None:
         if self.inference_interval_s <= 0 or self._last_inference_time is None:
@@ -172,11 +182,11 @@ class UR5eACTRealtimeInference:
             batch[key] = _prepare_image(images[key], feature.shape)
         return batch
 
-    def _clamp_pose_action(self, action: np.ndarray) -> np.ndarray:
+    def _clamp_action(self, action: np.ndarray) -> np.ndarray:
         safe = np.asarray(action, dtype=np.float64).copy()
 
-        if safe.shape[0] < 6:
-            raise ValueError(f"ACT action must have at least 6 values, got {safe.shape[0]}")
+        if safe.shape[0] < 7:
+            raise ValueError(f"ACT action must have at least 7 values, got {safe.shape[0]}")
 
         if self.max_pos_delta is not None:
             safe[:3] = np.clip(safe[:3], -self.max_pos_delta, self.max_pos_delta)
@@ -185,6 +195,9 @@ class UR5eACTRealtimeInference:
             rot_norm = float(np.linalg.norm(safe[3:6]))
             if rot_norm > self.max_rot_delta and rot_norm > 1e-12:
                 safe[3:6] *= self.max_rot_delta / rot_norm
+
+        if self.max_gripper_delta is not None:
+            safe[6] = np.clip(safe[6], -self.max_gripper_delta, self.max_gripper_delta)
 
         return safe
 
@@ -269,4 +282,3 @@ def _prepare_image(image: np.ndarray, expected_shape: tuple[int, int, int]) -> t
         ).squeeze(0)
 
     return image_chw.to(dtype=torch.float32)
-
