@@ -15,7 +15,7 @@ CAMERA_FPS = 30  # 相机帧率
 URIP = '192.168.3.15'
 
 predictor = UR5eACTRealtimeInference(
-    policy_path="../outputs/train/ur5e_act_a6000",
+    policy_path="../outputs/train/ur5e_act_1660ti",
     device="cuda",
     inference_interval_s=0.1,
 )
@@ -39,13 +39,13 @@ while (UR_states is None) or (gripper_fb is None) or trycount < 50:
     time.sleep(0.1)
     trycount = trycount + 1
 
-GripperController.move(0.99, speed=20, accel=10, force=20)
+GripperController.move(0.99, speed=10, accel=20, force=80)
 print("开始ACT测试！")
 time.sleep(1)
 # 正式开始循环
 while True:
     UR_states = URRealtimeClient.get_latest_state()
-    UR_tcp_pose = UR_states.tcp_pose
+    UR_tcp_pose = np.array(UR_states.tcp_pose)
     camera1_image = Camera1.get_rgb_frame().image
     camera2_image = Camera2.get_rgb_frame().image
     camera1_show = cv2.cvtColor(camera1_image, cv2.COLOR_RGB2BGR)
@@ -59,7 +59,7 @@ while True:
         break
 
     gripper_fb = GripperController.feedback
-    gripper = [gripper_fb.open, gripper_fb.current]
+    gripper = np.array([gripper_fb.open, gripper_fb.current])
     next_tcp_pose = predictor.predict_next_tcp_pose(
         camera1_image,
         camera2_image,
@@ -67,8 +67,12 @@ while True:
         gripper,
     )
     URScriptClient.movel(next_tcp_pose[:6], a=0.1, v=0.1, frame='base_abs')
+    # if next_tcp_pose[6] > 0.5:
+    #     next_tcp_pose[6] = 0.99
+    # else:
+    #     next_tcp_pose[6] = 0.0
     GripperController.set_target_position(next_tcp_pose[6])
-    print(next_tcp_pose)
+    print(f"{gripper_fb.current}|{next_tcp_pose[6]}")
 
     time.sleep(0.1)
 
