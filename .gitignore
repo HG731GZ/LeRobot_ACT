@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
+.codex
+
+# OS
+.DS_Store
+Thumbs.db
+
+# data
+data/
+
+# outputs
+outputs/

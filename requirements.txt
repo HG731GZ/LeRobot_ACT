@@ -1,0 +1,20 @@
+# Python 3.10 is recommended; this repo was verified in the conda env named LeRobot.
+#
+# Install Python packages:
+#   conda activate LeRobot
+#   python -m pip install -r requirements.txt
+#
+# Video decoding and GPU/NVENC encoding need FFmpeg shared libraries, which are
+# not represented by pip requirements. Install them separately with:
+#   conda install -n LeRobot -c conda-forge ffmpeg -y
+#
+# For NVIDIA GPU encoding, also make sure the host NVIDIA driver is installed
+# and that this command lists h264_nvenc:
+#   conda run -n LeRobot ffmpeg -hide_banner -encoders | grep h264_nvenc
+
+lerobot==0.4.4
+numpy>=2.2.0,<3.0.0
+Pillow>=12.0.0,<13.0.0
+pyarrow>=21.0.0
+pandas>=2.3.0
+av>=15.0.0,<16.0.0
