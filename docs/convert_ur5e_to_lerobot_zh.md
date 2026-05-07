@@ -133,7 +133,45 @@ python scripts/convert_ur5e_to_lerobot.py \
 
 ## 视频输入和输出
 
-新采集的 AVI 是输入视频。LeRobot 数据集里的视觉字段仍由脚本逐帧 `add_frame` 写入，然后按 `--image-storage` 决定最终存储形式：
+新采集的 AVI 是输入视频。脚本现在有两种视频处理模式：
+
+```bash
+--video-mode encode
+```
+
+这是默认稳定模式。脚本会从 AVI 或图片目录逐帧读取 RGB 图像，交给 `LeRobotDataset.add_frame()`，再由 LeRobot 保存成 MP4 或逐帧图片。
+
+```bash
+--video-mode passthrough
+```
+
+这是 AVI 直通模式。脚本不再把每帧解码成 RGB 后重新编码 MP4，而是用 FFmpeg 对原始 MJPG AVI 做轻量 remux，把视频头从采集文件里的 30 FPS 改成数据实际使用的 FPS，例如当前 `data/test2` 会改成 20 FPS：
+
+```bash
+ffmpeg -fflags +genpts -r 20 -i CAMERA_1.avi -c copy file-000.avi
+```
+
+输出数据集会使用 `.avi` 视频路径：
+
+```text
+videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.avi
+```
+
+直通模式会手动写入 LeRobot v3.0 所需的 `data/*.parquet`、`meta/info.json`、`meta/tasks.parquet`、`meta/episodes/*.parquet` 和 `meta/stats.json`。它要求帧表中的 `frame` 在保留长度内必须从 0 开始连续递增；如果原始帧需要跳帧、补帧或重排，请继续用默认的 `encode` 模式。
+
+使用当前样例生成 AVI 直通数据集：
+
+```bash
+conda activate LeRobot
+python scripts/convert_ur5e_to_lerobot.py \
+  --raw-root data/test2 \
+  --output-root data/lerobot/ur5e_cylinder_to_box \
+  --repo-id local/ur5e_cylinder_to_box \
+  --video-mode passthrough \
+  --overwrite
+```
+
+`encode` 模式下，LeRobot 数据集里的视觉字段仍由脚本逐帧 `add_frame` 写入，然后按 `--image-storage` 决定最终存储形式：
 
 ```bash
 --image-storage video
@@ -219,6 +257,43 @@ python scripts/convert_ur5e_to_lerobot.py --raw-root data/test2 --dry-run
 ```
 
 在当前 `data/test2/episode_000` 中，`TCP_POSE`、`GRIPPER`、`GRIPPER_TARGET`、两个相机帧表都是 245 行有效数据，因此不会截断。
+
+## 转换后校验
+
+先检查训练脚本是否接受数据集 schema：
+
+```bash
+python scripts/train_act_ur5e.py --dry-run
+```
+
+再直接读几帧，确认 AVI 时间轴和动作语义正确：
+
+```bash
+python - <<'PY'
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+ds = LeRobotDataset(
+    "local/ur5e_cylinder_to_box",
+    root="data/lerobot/ur5e_cylinder_to_box",
+    video_backend="pyav",
+)
+print(len(ds))
+for i in [0, 50, 100, len(ds) - 1]:
+    sample = ds[i]
+    print(
+        i,
+        sample["observation.images.camera_1"].shape,
+        float(sample["action"][-1]),
+        float(sample["timestamp"]),
+    )
+PY
+```
+
+重点看三点：
+
+- 第 0 帧 `action[-1]` 应该是夹钳目标开度，例如当前样例约为 `0.99`；
+- 图像 shape 应该是 `3 x 720 x 1280`；
+- 抽查第 0、50、100、最后一帧时不应出现 timestamp tolerance 报错。
 
 ## 输出字段
 
