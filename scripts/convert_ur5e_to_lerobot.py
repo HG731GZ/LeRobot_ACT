@@ -38,6 +38,7 @@ import re
 import shutil
 import statistics
 import struct
+import subprocess
 import sys
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -154,6 +155,15 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "videos", "images"],
         default="auto",
         help="Raw camera input source. auto prefers videos/ when present, otherwise images/.",
+    )
+    parser.add_argument(
+        "--video-mode",
+        choices=["encode", "passthrough"],
+        default="encode",
+        help=(
+            "encode keeps the stable LeRobot add_frame/save_episode path. "
+            "passthrough remuxes raw AVI files into the LeRobot video layout without RGB re-encoding."
+        ),
     )
     parser.add_argument(
         "--image-storage",
@@ -543,6 +553,7 @@ def print_plan(episodes: list[EpisodeInfo], fps: int, args: argparse.Namespace) 
     print(f"Output root: {args.output_root}")
     print(f"repo_id: {args.repo_id}")
     print(f"fps: {fps}")
+    print(f"video mode: {args.video_mode}")
     print(f"raw camera source: {args.camera_source}")
     print(f"image storage: {args.image_storage}")
     print(f"requested video codec: {args.vcodec}")
@@ -903,6 +914,351 @@ def validate_feature_compatibility(reference: EpisodeInfo, episode: EpisodeInfo)
         )
 
 
+def import_lerobot_passthrough_tools() -> dict:
+    try:
+        import datasets
+        import pyarrow.parquet as pq
+        from lerobot.datasets.compute_stats import (
+            auto_downsample_height_width,
+            compute_episode_stats,
+            get_feature_stats,
+            sample_indices,
+        )
+        from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        from lerobot.datasets.utils import get_hf_features_from_features, write_info
+        from lerobot.datasets.video_utils import get_video_info
+    except ImportError as exc:
+        raise ImportError(
+            "Cannot import LeRobot passthrough conversion dependencies. "
+            "Activate an environment with LeRobot installed, for example: conda activate LeRobot"
+        ) from exc
+
+    return {
+        "datasets": datasets,
+        "pq": pq,
+        "auto_downsample_height_width": auto_downsample_height_width,
+        "compute_episode_stats": compute_episode_stats,
+        "get_feature_stats": get_feature_stats,
+        "sample_indices": sample_indices,
+        "LeRobotDatasetMetadata": LeRobotDatasetMetadata,
+        "get_hf_features_from_features": get_hf_features_from_features,
+        "write_info": write_info,
+        "get_video_info": get_video_info,
+    }
+
+
+def validate_passthrough_episode(episode: EpisodeInfo) -> None:
+    for camera in episode.cameras:
+        if camera.source_kind != "videos" or camera.video_path is None:
+            raise ValueError(
+                "--video-mode passthrough requires raw video inputs. "
+                "Use --camera-source videos, or switch back to --video-mode encode."
+            )
+
+        expected = list(range(episode.length))
+        actual = camera.frame_indices[: episode.length]
+        if actual != expected:
+            raise ValueError(
+                f"{camera.raw_name} in {episode.path} is not contiguous from frame 0. "
+                "Passthrough cannot drop or reorder frames without re-encoding; "
+                "use --video-mode encode for sparse frame maps."
+            )
+
+
+def build_passthrough_episode_data(
+    episode: EpisodeInfo,
+    episode_index: int,
+    global_start_index: int,
+    task_index: int,
+    fps: int,
+    rotation_delta_mode: str,
+    include_current_in_action: bool,
+) -> dict:
+    import numpy as np
+
+    frame_indices = np.arange(episode.length, dtype=np.int64)
+    return {
+        "observation.state": np.stack(
+            [make_state(episode, frame_index) for frame_index in range(episode.length)]
+        ),
+        "action": np.stack(
+            [
+                make_action(
+                    episode,
+                    frame_index,
+                    rotation_delta_mode,
+                    include_current_in_action,
+                )
+                for frame_index in range(episode.length)
+            ]
+        ),
+        "timestamp": (frame_indices.astype(np.float32) / np.float32(fps)),
+        "frame_index": frame_indices,
+        "episode_index": np.full((episode.length,), episode_index, dtype=np.int64),
+        "index": np.arange(
+            global_start_index,
+            global_start_index + episode.length,
+            dtype=np.int64,
+        ),
+        "task_index": np.full((episode.length,), task_index, dtype=np.int64),
+    }
+
+
+def write_passthrough_data_parquet(
+    episode_data: dict,
+    features: dict,
+    path: Path,
+    tools: dict,
+) -> None:
+    datasets = tools["datasets"]
+    pq = tools["pq"]
+    get_hf_features_from_features = tools["get_hf_features_from_features"]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hf_features = get_hf_features_from_features(features)
+    hf_dataset = datasets.Dataset.from_dict(episode_data, features=hf_features, split="train")
+    table = hf_dataset.with_format("arrow")[:]
+
+    writer = pq.ParquetWriter(path, schema=table.schema, compression="snappy", use_dictionary=True)
+    try:
+        writer.write_table(table)
+    finally:
+        writer.close()
+
+
+def remux_video_passthrough(source: Path, destination: Path, fps: int) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise FileNotFoundError(
+            "ffmpeg was not found on PATH. Activate the LeRobot environment first: conda activate LeRobot"
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        destination.unlink()
+
+    common = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+    ]
+    commands = [
+        [
+            *common,
+            "-fflags",
+            "+genpts",
+            "-r",
+            str(fps),
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c",
+            "copy",
+            str(destination),
+        ],
+        [
+            *common,
+            "-r",
+            str(fps),
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c",
+            "copy",
+            str(destination),
+        ],
+    ]
+
+    errors: list[str] = []
+    for command in commands:
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode == 0 and destination.is_file():
+            return
+        stderr = (result.stderr or result.stdout or "").strip()
+        errors.append(f"{' '.join(command)}\n{stderr}")
+        if destination.exists():
+            destination.unlink()
+
+    raise RuntimeError(
+        f"Failed to remux {source} to {destination} with stream copy. "
+        "Tried:\n" + "\n\n".join(errors)
+    )
+
+
+def compute_passthrough_video_stats(video_path: Path, length: int, tools: dict) -> dict:
+    import av
+    import numpy as np
+
+    av.logging.set_level(av.logging.ERROR)
+
+    auto_downsample_height_width = tools["auto_downsample_height_width"]
+    get_feature_stats = tools["get_feature_stats"]
+    sample_indices = tools["sample_indices"]
+
+    sampled_indices = sample_indices(length)
+    wanted = {frame_index: position for position, frame_index in enumerate(sampled_indices)}
+    max_wanted = max(wanted)
+    images = None
+    found = 0
+    decoded_index = -1
+
+    with av.open(str(video_path)) as container:
+        stream = next((item for item in container.streams if item.type == "video"), None)
+        if stream is None:
+            raise ValueError(f"{video_path} has no video stream")
+
+        for frame in container.decode(stream):
+            decoded_index += 1
+            if decoded_index not in wanted:
+                if decoded_index > max_wanted:
+                    break
+                continue
+
+            image = frame.to_ndarray(format="rgb24").transpose(2, 0, 1)
+            image = auto_downsample_height_width(image)
+            if images is None:
+                images = np.empty((len(sampled_indices), *image.shape), dtype=np.uint8)
+            images[wanted[decoded_index]] = image
+            found += 1
+            if found == len(sampled_indices):
+                break
+
+    if images is None or found != len(sampled_indices):
+        raise EOFError(
+            f"{video_path} ended before stats sampling completed "
+            f"({found}/{len(sampled_indices)} frames decoded)."
+        )
+
+    stats = get_feature_stats(images, axis=(0, 2, 3), keepdims=True)
+    return {key: value if key == "count" else value.squeeze(axis=0) / 255.0 for key, value in stats.items()}
+
+
+def create_passthrough_dataset(args: argparse.Namespace, episodes: list[EpisodeInfo], fps: int):
+    if args.image_storage != "video":
+        raise ValueError("--video-mode passthrough requires --image-storage video.")
+
+    tools = import_lerobot_passthrough_tools()
+    LeRobotDatasetMetadata = tools["LeRobotDatasetMetadata"]
+    write_info = tools["write_info"]
+    get_video_info = tools["get_video_info"]
+    compute_episode_stats = tools["compute_episode_stats"]
+
+    output_root = args.output_root.expanduser().resolve()
+    if output_root.exists():
+        if not args.overwrite:
+            raise FileExistsError(
+                f"{output_root} already exists. Pass --overwrite to replace it."
+            )
+        shutil.rmtree(output_root)
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+
+    features = build_features(
+        cameras=episodes[0].cameras,
+        image_storage="video",
+        include_current_in_action=args.include_current_in_action,
+    )
+    meta = LeRobotDatasetMetadata.create(
+        repo_id=args.repo_id,
+        root=output_root,
+        fps=fps,
+        robot_type=args.robot_type,
+        features=features,
+        use_videos=True,
+    )
+    meta.info["video_path"] = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.avi"
+    write_info(meta.info, meta.root)
+    meta.save_episode_tasks([args.task])
+    task_index = meta.get_task_index(args.task)
+    if task_index is None:
+        raise RuntimeError(f"Failed to register task: {args.task}")
+
+    full_features = meta.info["features"]
+    non_video_features = {
+        key: feature for key, feature in full_features.items()
+        if feature["dtype"] != "video"
+    }
+    global_start_index = 0
+
+    for episode_index, episode in enumerate(episodes):
+        validate_feature_compatibility(episodes[0], episode)
+        validate_passthrough_episode(episode)
+
+        chunk_index = episode_index // meta.chunks_size
+        file_index = episode_index % meta.chunks_size
+        print(f"Passthrough {episode.path.name}: {episode.length} frames")
+
+        episode_data = build_passthrough_episode_data(
+            episode=episode,
+            episode_index=episode_index,
+            global_start_index=global_start_index,
+            task_index=task_index,
+            fps=fps,
+            rotation_delta_mode=args.rotation_delta_mode,
+            include_current_in_action=args.include_current_in_action,
+        )
+        data_path = output_root / meta.data_path.format(
+            chunk_index=chunk_index,
+            file_index=file_index,
+        )
+        write_passthrough_data_parquet(
+            episode_data=episode_data,
+            features=full_features,
+            path=data_path,
+            tools=tools,
+        )
+
+        episode_metadata = {
+            "data/chunk_index": chunk_index,
+            "data/file_index": file_index,
+        }
+        episode_stats = compute_episode_stats(episode_data, non_video_features)
+
+        for camera in episode.cameras:
+            if camera.video_path is None:
+                raise ValueError(f"{camera.raw_name} has no video path")
+            video_path = output_root / meta.video_path.format(
+                video_key=camera.feature_key,
+                chunk_index=chunk_index,
+                file_index=file_index,
+            )
+            remux_video_passthrough(camera.video_path, video_path, fps)
+            if episode_index == 0:
+                meta.info["features"][camera.feature_key]["info"] = get_video_info(video_path)
+                write_info(meta.info, meta.root)
+
+            episode_stats[camera.feature_key] = compute_passthrough_video_stats(
+                video_path=video_path,
+                length=episode.length,
+                tools=tools,
+            )
+            episode_metadata.update(
+                {
+                    f"videos/{camera.feature_key}/chunk_index": chunk_index,
+                    f"videos/{camera.feature_key}/file_index": file_index,
+                    f"videos/{camera.feature_key}/from_timestamp": 0.0,
+                    f"videos/{camera.feature_key}/to_timestamp": episode.length / fps,
+                }
+            )
+
+        meta.save_episode(
+            episode_index=episode_index,
+            episode_length=episode.length,
+            episode_tasks=[args.task],
+            episode_stats=episode_stats,
+            episode_metadata=episode_metadata,
+        )
+        global_start_index += episode.length
+
+    meta._close_writer()
+    return output_root
+
+
 def main() -> int:
     args = parse_args()
     episodes = [
@@ -915,7 +1271,10 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    output_root = create_dataset(args, episodes, fps)
+    if args.video_mode == "passthrough":
+        output_root = create_passthrough_dataset(args, episodes, fps)
+    else:
+        output_root = create_dataset(args, episodes, fps)
     print(f"Done. LeRobot dataset written to: {output_root}")
     return 0
 
