@@ -33,7 +33,7 @@ GripperController.start(interval=0.05)
 UR_states = URRealtimeClient.get_latest_state()
 gripper_fb = GripperController.feedback
 trycount = 0
-while (UR_states is None) or (gripper_fb is None) or trycount >= 50:
+while (UR_states is None) or (gripper_fb is None) or trycount < 50:
     UR_states = URRealtimeClient.get_latest_state()
     gripper_fb = GripperController.feedback
     time.sleep(0.1)
