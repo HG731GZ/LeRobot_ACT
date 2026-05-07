@@ -1,3 +1,5 @@
+import cv2
+
 from UR_Utils.URRealtimeClient import URRealtimeClient
 from UR_Utils.URScriptClient import URScriptClient
 from UR_Utils.GripperController import GripperController
@@ -6,6 +8,7 @@ import scripts.ur_action_to_pose
 from scripts.ur5e_act_realtime_inference import UR5eACTRealtimeInference
 import time
 import numpy as np
+import cv2
 
 CAMERA_RESOLUTION = (1280, 720)  # 相机分辨率，RGB和深度统一设定
 CAMERA_FPS = 30  # 相机帧率
@@ -36,13 +39,25 @@ while (UR_states is None) or (gripper_fb is None) or trycount >= 50:
     time.sleep(0.1)
     trycount = trycount + 1
 
+GripperController.move(0.99, speed=20, accel=10, force=20)
 print("开始ACT测试！")
+time.sleep(1)
 # 正式开始循环
 while True:
     UR_states = URRealtimeClient.get_latest_state()
     UR_tcp_pose = UR_states.tcp_pose
     camera1_image = Camera1.get_rgb_frame().image
     camera2_image = Camera2.get_rgb_frame().image
+    camera1_show = cv2.cvtColor(camera1_image, cv2.COLOR_RGB2BGR)
+    camera2_show = cv2.cvtColor(camera2_image, cv2.COLOR_RGB2BGR)
+
+    cv2.imshow("camera1", camera1_show)
+    cv2.imshow("camera2", camera2_show)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+
     gripper_fb = GripperController.feedback
     gripper = [gripper_fb.open, gripper_fb.current]
     next_tcp_pose = predictor.predict_next_tcp_pose(
@@ -51,7 +66,10 @@ while True:
         UR_tcp_pose,
         gripper,
     )
-    URScriptClient.movel(next_tcp_pose, v=0.1, frame='base_abs')
+    URScriptClient.movel(next_tcp_pose[:6], a=0.1, v=0.1, frame='base_abs')
+    GripperController.set_target_position(next_tcp_pose[6])
     print(next_tcp_pose)
 
     time.sleep(0.1)
+
+cv2.destroyAllWindows()
