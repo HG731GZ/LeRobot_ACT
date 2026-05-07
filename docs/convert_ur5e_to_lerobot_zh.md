@@ -1,6 +1,13 @@
 # UR5e 数据转换为 LeRobot ACT 格式说明
 
-本文档说明如何使用 `scripts/convert_ur5e_to_lerobot.py`，把 UR5e 采集的 CSV 数值数据和相机图像转换成 LeRobot ACT 可读取的数据集。
+本文档说明如何使用 `scripts/convert_ur5e_to_lerobot.py`，把 UR5e 采集的 CSV 数值数据和相机视频转换成 LeRobot ACT 可读取的数据集。
+
+当前脚本支持新的采集格式：
+
+- 数值数据：`TCP_POSE.csv`、`GRIPPER.csv`、`GRIPPER_TARGET.csv`
+- 图像数据：MJPG 编码的 AVI 文件，以及对应的帧索引和时间戳 CSV
+
+脚本仍兼容旧的逐帧图片目录输入，但默认会优先自动识别 `videos/`。
 
 ## 环境安装
 
@@ -12,7 +19,7 @@ python -m pip install -r requirements.txt
 conda install -n LeRobot -c conda-forge ffmpeg -y
 ```
 
-其中 `requirements.txt` 安装 Python 包，`ffmpeg` 负责给 LeRobot 默认的视频解码后端提供动态库。
+其中 `requirements.txt` 安装 Python 包，`ffmpeg` 负责给 LeRobot 默认的视频解码/编码后端提供动态库。新视频输入依赖 `av` 读取 AVI，`requirements.txt` 已包含该依赖。
 
 如果要使用 NVIDIA GPU 编码，确认系统能看到显卡和 NVENC：
 
@@ -25,21 +32,20 @@ conda run -n LeRobot ffmpeg -hide_banner -encoders | grep h264_nvenc
 
 ## 原始数据目录
 
-单条轨迹的目录结构应类似：
+单条新轨迹的目录结构应类似：
 
 ```text
-data/test1/
+data/test2/
   episode_000/
     numeric/
       TCP_POSE.csv
       GRIPPER.csv
-    images/
-      CAMERA_1/
-        step_000000_rgb.png
-        step_000001_rgb.png
-      CAMERA_2/
-        step_000000_rgb.png
-        step_000001_rgb.png
+      GRIPPER_TARGET.csv
+    videos/
+      CAMERA_1.avi
+      CAMERA_1_frames.csv
+      CAMERA_2.avi
+      CAMERA_2_frames.csv
 ```
 
 `TCP_POSE.csv` 需要包含：
@@ -54,14 +60,57 @@ timestamp,TCP_POSE_1,TCP_POSE_2,TCP_POSE_3,TCP_POSE_4,TCP_POSE_5,TCP_POSE_6
 timestamp,GRIPPER_1,GRIPPER_2
 ```
 
-其中 `TCP_POSE_1..3` 是 TCP 位置，`TCP_POSE_4..6` 是 UR 风格的旋转向量 `rx, ry, rz`；`GRIPPER_1` 是夹钳开度，`GRIPPER_2` 是夹钳电流。
+`GRIPPER_TARGET.csv` 需要包含：
+
+```text
+timestamp,GRIPPER_TARGET_1
+```
+
+其中 `TCP_POSE_1..3` 是 TCP 位置，`TCP_POSE_4..6` 是 UR 风格的旋转向量 `rx, ry, rz`；`GRIPPER_1` 是实际夹钳开度，`GRIPPER_2` 是夹钳电流；`GRIPPER_TARGET_1` 是采集时记录的夹钳目标开度。
+
+每个视频都需要一个同名帧表，命名为：
+
+```text
+CAMERA_1.avi          -> CAMERA_1_frames.csv
+CAMERA_2.avi          -> CAMERA_2_frames.csv
+```
+
+帧表需要包含：
+
+```text
+frame,step,timestamp
+```
+
+脚本会使用 `frame` 列从 AVI 中按顺序取帧，并保留 `timestamp` 用于检查和 dry-run 信息。`step` 列允许存在，但当前转换按行号对齐，不用它重采样。
+
+旧的图片目录仍可使用：
+
+```text
+episode_000/
+  images/
+    CAMERA_1/
+      step_000000_rgb.png
+      step_000001_rgb.png
+    CAMERA_2/
+      step_000000_rgb.png
+      step_000001_rgb.png
+```
+
+如需强制选择输入形式，可使用：
+
+```bash
+--camera-source videos
+--camera-source images
+```
+
+默认 `--camera-source auto` 会优先使用 `videos/`，没有视频时再使用 `images/`。
 
 ## 批量转换
 
-可以批量转换。是的，只要在 `test1` 文件夹里并列放置多个 `episode_xxx` 文件夹即可，例如：
+可以批量转换。只要在原始数据根目录里并列放置多个 `episode_xxx` 文件夹即可，例如：
 
 ```text
-data/test1/
+data/test2/
   episode_000/
   episode_001/
   episode_002/
@@ -72,15 +121,31 @@ data/test1/
 ```bash
 conda activate LeRobot
 python scripts/convert_ur5e_to_lerobot.py \
-  --raw-root data/test1 \
+  --raw-root data/test2 \
   --output-root data/lerobot/ur5e_cylinder_to_box \
   --repo-id local/ur5e_cylinder_to_box \
   --overwrite
 ```
 
-脚本会自动发现 `data/test1` 下所有包含 `numeric/TCP_POSE.csv` 和 `numeric/GRIPPER.csv` 的 episode 目录。也可以把 `--raw-root` 直接指向单个 episode 目录，只转换这一条。
+脚本会自动发现 `data/test2` 下所有包含 `numeric/TCP_POSE.csv` 和 `numeric/GRIPPER.csv` 的 episode 目录。也可以把 `--raw-root` 直接指向单个 episode 目录，只转换这一条。
 
-注意：批量转换时，不同 episode 的相机集合和图像尺寸需要一致。例如第一条 episode 有 `CAMERA_1`、`CAMERA_2`，后续 episode 也应有同样的相机目录和分辨率。
+注意：批量转换时，不同 episode 的相机集合和图像尺寸需要一致。例如第一条 episode 有 `CAMERA_1`、`CAMERA_2`，后续 episode 也应有同样的相机名和分辨率。
+
+## 视频输入和输出
+
+新采集的 AVI 是输入视频。LeRobot 数据集里的视觉字段仍由脚本逐帧 `add_frame` 写入，然后按 `--image-storage` 决定最终存储形式：
+
+```bash
+--image-storage video
+```
+
+这是默认值，会把图像观测保存成 LeRobot 管理的 MP4 视频。
+
+```bash
+--image-storage image
+```
+
+这个选项会把图像观测保存成逐帧图片，通常只用于排查或兼容特殊流程。
 
 ## GPU 视频编码
 
@@ -114,7 +179,7 @@ h264_nvenc
 
 ```bash
 python scripts/convert_ur5e_to_lerobot.py \
-  --raw-root data/test1 \
+  --raw-root data/test2 \
   --output-root data/lerobot/ur5e_cylinder_to_box \
   --repo-id local/ur5e_cylinder_to_box \
   --overwrite \
@@ -135,22 +200,25 @@ streaming 模式会在 `add_frame` 时直接把图像送进视频编码器，减
 --no-streaming-encoding
 ```
 
-本机样例 `episode_000` 测试结果：`--vcodec auto` 解析为 `h264_nvenc`；再加 `--streaming-encoding` 后，可以正常生成 272 帧视频，没有丢帧警告。
+当前 `data/test2/episode_000` 样例有 245 帧，两个相机视频均为 MJPG AVI，分辨率为 `1280 x 720`，脚本 dry-run 可正常识别为 `20 FPS`。
 
 ## 长度对齐和截断
 
-同一条 episode 内，脚本按行号和图像序号对齐各模态：
+同一条 episode 内，脚本按行号和帧表顺序对齐各模态：
 
 - `TCP_POSE.csv` 第 i 行
 - `GRIPPER.csv` 第 i 行
-- `CAMERA_1/step_00000i_rgb.png`
-- `CAMERA_2/step_00000i_rgb.png`
+- `GRIPPER_TARGET.csv` 第 i 行
+- `CAMERA_1_frames.csv` 第 i 行对应的 `CAMERA_1.avi` 帧
+- `CAMERA_2_frames.csv` 第 i 行对应的 `CAMERA_2.avi` 帧
 
-如果图像数量少于数值数据，脚本会取所有模态的公共最短长度，直接丢弃末尾多出来的数据。dry-run 会打印每条 episode 实际保留的长度和丢弃数量：
+如果某个模态数量少于其他模态，脚本会取所有模态的公共最短长度，直接丢弃末尾多出来的数据。dry-run 会打印每条 episode 实际保留的长度和丢弃数量：
 
 ```bash
-python scripts/convert_ur5e_to_lerobot.py --raw-root data/test1 --dry-run
+python scripts/convert_ur5e_to_lerobot.py --raw-root data/test2 --dry-run
 ```
+
+在当前 `data/test2/episode_000` 中，`TCP_POSE`、`GRIPPER`、`GRIPPER_TARGET`、两个相机帧表都是 245 行有效数据，因此不会截断。
 
 ## 输出字段
 
@@ -171,15 +239,19 @@ observation.images.camera_2
 
 这里的 `tcp_rx, tcp_ry, tcp_rz` 保留原始 UR 旋转向量。这样做的原因是 state 表示当前观测，原始数据最直接，也便于回放和排查。
 
-`action` 默认是 7 维增量：
+`action` 默认是 7 维：
 
 ```text
 [delta_tcp_x, delta_tcp_y, delta_tcp_z,
  delta_tcp_rx, delta_tcp_ry, delta_tcp_rz,
- delta_gripper_opening]
+ gripper_target_opening]
 ```
 
-第 0 帧 action 固定为全 0。第 i 帧 action 表示从第 i-1 帧到第 i 帧的变化量。
+前 6 维仍是从第 i-1 帧到第 i 帧的 TCP 增量。第 7 维不再是夹钳开度增量，而是 `GRIPPER_TARGET.csv` 中的绝对目标开度。
+
+第 0 帧 action 的 TCP 增量为 0，但夹钳维度会写入第 0 行的目标开度。例如当前样例第 0 帧 action 的最后一维约为 `0.99`，不是 0。
+
+如果原始数据没有 `GRIPPER_TARGET.csv`，脚本会退回使用 `GRIPPER.csv` 里的实际开度作为目标开度，并在 dry-run 中显示 `GRIPPER.csv fallback opening`。新数据建议始终提供 `GRIPPER_TARGET.csv`。
 
 ## 姿态表达和旋转增量
 
@@ -208,13 +280,13 @@ delta_rotvec = log(R_delta)
 
 这对增量控制更友好，因为 action 表示的是实际的小步相对运动，而不是两个可能跳变的绝对旋转向量之间的坐标差。
 
-在当前 `data/test1/episode_000` 样例里，直接相减的旋转增量最大值约为 `6.28 rad`，而相对旋转向量的最大值约为 `0.02 rad`。这说明样例轨迹已经出现了接近 `-pi/pi` 等价表示导致的跳变，默认的 `relative-rotvec` 是必要的。
+在当前 `data/test2/episode_000` 样例里，直接相减的旋转增量最大值约为 `6.18 rad`，而相对旋转向量的最大值约为 `0.023 rad`。这说明样例轨迹已经出现了接近 `-pi/pi` 等价表示导致的跳变，默认的 `relative-rotvec` 是必要的。
 
 如需使用原始旋转向量直接相减，可以显式指定：
 
 ```bash
 python scripts/convert_ur5e_to_lerobot.py \
-  --raw-root data/test1 \
+  --raw-root data/test2 \
   --rotation-delta-mode raw-rotvec \
   --overwrite
 ```
@@ -222,6 +294,12 @@ python scripts/convert_ur5e_to_lerobot.py \
 一般不建议这样做，除非你后续控制器或训练代码明确要求直接相减的 UR rotvec 增量。
 
 ## 常用参数
+
+指定输入数据：
+
+```bash
+--raw-root data/test2
+```
 
 指定输出目录：
 
@@ -253,7 +331,14 @@ python scripts/convert_ur5e_to_lerobot.py \
 --cameras CAMERA_1 CAMERA_2
 ```
 
-使用图像文件而不是视频存储：
+强制使用视频或图片作为输入：
+
+```bash
+--camera-source videos
+--camera-source images
+```
+
+使用图像文件而不是视频作为 LeRobot 输出存储：
 
 ```bash
 --image-storage image
@@ -275,6 +360,13 @@ python scripts/convert_ur5e_to_lerobot.py \
 
 ## 验证输出
 
+转换前可以先 dry-run：
+
+```bash
+conda activate LeRobot
+python scripts/convert_ur5e_to_lerobot.py --raw-root data/test2 --dry-run
+```
+
 转换完成后，可以用 LeRobot 读回检查：
 
 ```bash
@@ -294,4 +386,4 @@ print(sample["observation.images.camera_1"].shape)
 PY
 ```
 
-正常情况下，第 0 帧 action 应为全 0，图像张量形状为 `(3, height, width)`。
+正常情况下，第 0 帧 action 的前 6 维为 0，最后一维为夹钳目标开度；图像张量形状为 `(3, height, width)`。

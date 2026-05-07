@@ -21,6 +21,25 @@ from typing import Any
 DEFAULT_DATASET_ROOT = Path("data/lerobot/ur5e_cylinder_to_box")
 DEFAULT_REPO_ID = "local/ur5e_cylinder_to_box"
 CONFIG_DIR = Path("outputs/train_configs")
+EXPECTED_STATE_NAMES = [
+    "tcp_x",
+    "tcp_y",
+    "tcp_z",
+    "tcp_rx",
+    "tcp_ry",
+    "tcp_rz",
+    "gripper_opening",
+    "gripper_current",
+]
+EXPECTED_ACTION_NAMES = [
+    "delta_tcp_x",
+    "delta_tcp_y",
+    "delta_tcp_z",
+    "delta_tcp_rx",
+    "delta_tcp_ry",
+    "delta_tcp_rz",
+    "gripper_target_opening",
+]
 
 
 @dataclass(frozen=True)
@@ -108,6 +127,14 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--overwrite-output", action="store_true", help="Delete output-dir before training.")
     parser.add_argument("--dry-run", action="store_true", help="Only print the generated config and command.")
     parser.add_argument("--config-output", type=Path, default=None, help="Where to write the generated config.")
+    parser.add_argument(
+        "--skip-dataset-schema-check",
+        action="store_true",
+        help=(
+            "Skip validation that observation.state/action names match the current UR5e schema. "
+            "Normally keep this enabled to catch legacy gripper-delta datasets."
+        ),
+    )
 
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -266,6 +293,57 @@ def print_json(path: Path) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def validate_dataset_schema(dataset_root: Path) -> dict[str, Any]:
+    info_path = dataset_root / "meta" / "info.json"
+    with info_path.open("r") as stream:
+        info = json.load(stream)
+
+    features = info.get("features", {})
+    state_names_payload = features.get("observation.state", {}).get("names") or {}
+    action_names_payload = features.get("action", {}).get("names") or {}
+    state_names = state_names_payload.get("state") if isinstance(state_names_payload, dict) else None
+    action_names = action_names_payload.get("action") if isinstance(action_names_payload, dict) else None
+
+    errors: list[str] = []
+    if state_names != EXPECTED_STATE_NAMES:
+        errors.append(
+            "observation.state names mismatch:\n"
+            f"  expected: {EXPECTED_STATE_NAMES}\n"
+            f"  got:      {state_names}"
+        )
+    if action_names != EXPECTED_ACTION_NAMES:
+        errors.append(
+            "action names mismatch:\n"
+            f"  expected: {EXPECTED_ACTION_NAMES}\n"
+            f"  got:      {action_names}\n"
+            "如果这里看到 delta_gripper_opening，说明数据集还是旧转换结果；"
+            "请先用新版 convert_ur5e_to_lerobot.py 重新转换。"
+        )
+
+    if errors:
+        raise ValueError("\n".join(errors))
+    return info
+
+
+def resume_dataset_root(config_path: Path) -> Path | None:
+    with config_path.open("r") as stream:
+        payload = json.load(stream)
+    root = payload.get("dataset", {}).get("root")
+    if root is None:
+        return None
+    return Path(root).expanduser().resolve()
+
+
+def print_dataset_summary(info: dict[str, Any]) -> None:
+    print(
+        "Dataset schema OK: "
+        f"episodes={info.get('total_episodes')}, "
+        f"frames={info.get('total_frames')}, "
+        f"fps={info.get('fps')}, "
+        "action[-1]=gripper_target_opening"
+    )
+
+
 def main() -> int:
     args, unknown_lerobot_args = parse_args()
 
@@ -273,6 +351,10 @@ def main() -> int:
         resume_config = args.resume_config.expanduser().resolve()
         if not resume_config.is_file():
             raise FileNotFoundError(resume_config)
+        if not args.skip_dataset_schema_check:
+            resumed_dataset_root = resume_dataset_root(resume_config)
+            if resumed_dataset_root is not None:
+                print_dataset_summary(validate_dataset_schema(resumed_dataset_root))
         command = [
             sys.executable,
             "-m",
@@ -290,6 +372,8 @@ def main() -> int:
     dataset_root = args.dataset_root.expanduser().resolve()
     if not (dataset_root / "meta" / "info.json").is_file():
         raise FileNotFoundError(f"找不到 LeRobot 数据集元信息：{dataset_root / 'meta' / 'info.json'}")
+    if not args.skip_dataset_schema_check:
+        print_dataset_summary(validate_dataset_schema(dataset_root))
 
     preset_name, preset = select_preset(args.preset)
     cfg, draccus = build_config(args, preset_name, preset)

@@ -1,26 +1,29 @@
-# UR5e 圆柱入盒任务 ACT 训练与测试说明
+# UR5e 圆柱入盒任务 ACT 训练与推理说明
 
 本文档对应：
 
 - `scripts/train_act_ur5e.py`
 - `scripts/test_act_ur5e.py`
+- `scripts/ur5e_act_realtime_inference.py`
 - 数据集：`data/lerobot/ur5e_cylinder_to_box`
 
-当前数据集是 LeRobot v3.0 格式，共 50 条轨迹、11515 帧、19 FPS、两路 720p 相机。`observation.state` 为 8 维：
+数据集应先由新版 `scripts/convert_ur5e_to_lerobot.py` 转成 LeRobot v3.0 格式。`observation.state` 为 8 维：
 
 ```text
 [tcp_x, tcp_y, tcp_z, tcp_rx, tcp_ry, tcp_rz, gripper_opening, gripper_current]
 ```
 
-`action` 为 7 维相邻帧增量：
+`action` 为 7 维：
 
 ```text
 [delta_tcp_x, delta_tcp_y, delta_tcp_z,
  delta_tcp_rx, delta_tcp_ry, delta_tcp_rz,
- delta_gripper_opening]
+ gripper_target_opening]
 ```
 
-旋转增量默认是 `relative-rotvec`，测试脚本也按这个方式把网络动作还原成下一步 UR TCP 位姿。
+前 6 维是相邻帧 TCP 增量，旋转增量默认是 `relative-rotvec`。第 7 维是夹钳绝对目标开度，来自转换数据集时的 `GRIPPER_TARGET.csv`，不是夹钳开度增量。测试和实时推理脚本也按这个方式把网络动作还原成下一步 UR TCP 位姿和夹钳目标。
+
+训练脚本会默认检查数据集 schema。如果 `action` 最后一维仍是 `delta_gripper_opening`，说明数据集还是旧转换结果，需要先重新转换。
 
 ## 环境
 
@@ -37,6 +40,8 @@ python scripts/train_act_ur5e.py --dry-run
 ```
 
 本仓库训练脚本默认使用 `--video-backend pyav`，因为当前环境里 `torchcodec` 可能受 FFmpeg/C++ 动态库版本影响。如果你在 A6000 工作站上确认 torchcodec 可用，可以加 `--video-backend torchcodec`。
+
+如果只是临时查看旧数据集配置，可以加 `--skip-dataset-schema-check` 跳过 schema 检查；正式训练新版策略时不建议跳过。
 
 ## 在 1660Ti 上训练
 
@@ -164,7 +169,7 @@ predictor = UR5eACTRealtimeInference(
     inference_interval_s=0.05,
     max_pos_delta=0.005,
     max_rot_delta=0.03,
-    max_gripper_delta=0.08,
+    max_gripper_step=0.08,
 )
 
 while True:
@@ -183,7 +188,7 @@ while True:
     send_gripper_opening(next_command[6])
 ```
 
-脚本内部会把 ACT 输出的前 6 维 TCP 增量通过 `scripts/ur_action_to_pose.py` 转成下一步 UR TCP Pose，第 7 维会按当前夹钳开度加上网络预测的夹钳开度增量，并裁剪到 `[0, 1]`。默认旋转模式是 `relative-rotvec`，和数据转换脚本保持一致。
+脚本内部会把 ACT 输出的前 6 维 TCP 增量通过 `scripts/ur_action_to_pose.py` 转成下一步 UR TCP Pose，第 7 维直接作为夹钳绝对目标开度，并裁剪到 `[0, 1]`。如果设置了 `max_gripper_step`，会额外把目标开度限制在当前开度附近，用于真实硬件首次闭环时的小步安全验证。默认旋转模式是 `relative-rotvec`，和数据转换脚本保持一致。
 
 ## 接真实 UR5e
 
@@ -204,7 +209,8 @@ python scripts/test_act_ur5e.py \
   --backend ur5e \
   --max-steps 200 \
   --max-pos-delta 0.005 \
-  --max-rot-delta 0.03
+  --max-rot-delta 0.03 \
+  --max-gripper-step 0.08
 ```
 
 确认坐标系、相机顺序、夹爪单位和安全限幅都正确后，再加：
@@ -213,4 +219,4 @@ python scripts/test_act_ur5e.py \
 --execute
 ```
 
-真实机械臂首次闭环时建议把 `--max-pos-delta` 和 `--max-rot-delta` 设得更保守，并准备物理急停。
+真实机械臂首次闭环时建议把 `--max-pos-delta`、`--max-rot-delta` 和 `--max-gripper-step` 设得更保守，并准备物理急停。

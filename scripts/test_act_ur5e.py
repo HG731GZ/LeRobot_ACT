@@ -4,6 +4,10 @@
 This machine is not connected to the real UR5e, so the real robot interface is
 left as a clearly marked adapter. The default backend replays observations from
 the local LeRobot dataset and prints the target commands that would be sent.
+
+Expected ACT action layout:
+[delta_tcp_x, delta_tcp_y, delta_tcp_z, delta_tcp_rx, delta_tcp_ry, delta_tcp_rz,
+gripper_target_opening]. The final gripper value is an absolute target opening.
 """
 
 from __future__ import annotations
@@ -35,6 +39,15 @@ STATE_NAMES = [
     "tcp_rz",
     "gripper_opening",
     "gripper_current",
+]
+ACTION_NAMES = [
+    "delta_tcp_x",
+    "delta_tcp_y",
+    "delta_tcp_z",
+    "delta_tcp_rx",
+    "delta_tcp_ry",
+    "delta_tcp_rz",
+    "gripper_target_opening",
 ]
 
 
@@ -164,7 +177,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mock-episode", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-steps", type=int, default=100)
-    parser.add_argument("--fps", type=float, default=19.0)
+    parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--execute", action="store_true", help="Actually send commands for non-mock backends.")
     parser.add_argument(
         "--rotation-delta-mode",
@@ -174,7 +187,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-pos-delta", type=float, default=0.015, help="Safety clamp per xyz axis, meters.")
     parser.add_argument("--max-rot-delta", type=float, default=0.08, help="Safety clamp for rotvec norm, radians.")
-    parser.add_argument("--max-gripper-delta", type=float, default=0.08)
+    parser.add_argument(
+        "--max-gripper-step",
+        type=float,
+        default=None,
+        help=(
+            "Optional safety clamp for the absolute gripper target. "
+            "When set, target is limited to current_opening +/- this value."
+        ),
+    )
+    parser.add_argument(
+        "--max-gripper-delta",
+        dest="max_gripper_step",
+        type=float,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--gripper-min", type=float, default=0.0)
     parser.add_argument("--gripper-max", type=float, default=1.0)
     return parser.parse_args()
@@ -271,16 +298,31 @@ def clamp_action(
     action: np.ndarray,
     max_pos_delta: float,
     max_rot_delta: float,
-    max_gripper_delta: float,
+    gripper_min: float,
+    gripper_max: float,
+    current_gripper_opening: float,
+    max_gripper_step: float | None,
 ) -> np.ndarray:
     safe = np.asarray(action, dtype=np.float64).copy()
+    if safe.shape[0] < len(ACTION_NAMES):
+        raise ValueError(f"ACT action must have at least {len(ACTION_NAMES)} values, got {safe.shape[0]}")
+
     safe[:3] = np.clip(safe[:3], -max_pos_delta, max_pos_delta)
 
     rot_norm = float(np.linalg.norm(safe[3:6]))
     if rot_norm > max_rot_delta and rot_norm > 1e-12:
         safe[3:6] *= max_rot_delta / rot_norm
 
-    safe[6] = float(np.clip(safe[6], -max_gripper_delta, max_gripper_delta))
+    safe[6] = float(np.clip(safe[6], gripper_min, gripper_max))
+    if max_gripper_step is not None:
+        safe[6] = float(
+            np.clip(
+                safe[6],
+                current_gripper_opening - max_gripper_step,
+                current_gripper_opening + max_gripper_step,
+            )
+        )
+        safe[6] = float(np.clip(safe[6], gripper_min, gripper_max))
     return safe
 
 
@@ -302,6 +344,11 @@ def make_runtime(args: argparse.Namespace, camera_keys: list[str]):
 
 def main() -> int:
     args = parse_args()
+    if args.gripper_min >= args.gripper_max:
+        raise ValueError("--gripper-min must be smaller than --gripper-max")
+    if args.max_gripper_step is not None and args.max_gripper_step < 0:
+        raise ValueError("--max-gripper-step must be >= 0")
+
     pretrained_dir = resolve_pretrained_model_dir(args.policy_path)
     policy, preprocessor, postprocessor = load_policy_and_processors(pretrained_dir, args.device)
     camera_keys = list(policy.config.image_features.keys())
@@ -325,7 +372,10 @@ def main() -> int:
                 action_np,
                 max_pos_delta=args.max_pos_delta,
                 max_rot_delta=args.max_rot_delta,
-                max_gripper_delta=args.max_gripper_delta,
+                gripper_min=args.gripper_min,
+                gripper_max=args.gripper_max,
+                current_gripper_opening=observation.gripper_opening,
+                max_gripper_step=args.max_gripper_step,
             )
 
             target_tcp_pose = np.asarray(
@@ -336,13 +386,7 @@ def main() -> int:
                 ),
                 dtype=np.float64,
             )
-            target_gripper = float(
-                np.clip(
-                    observation.gripper_opening + action_np[6],
-                    args.gripper_min,
-                    args.gripper_max,
-                )
-            )
+            target_gripper = float(action_np[6])
 
             print(
                 f"step={step:04d} action={np.array2string(action_np, precision=5, suppress_small=False)}"

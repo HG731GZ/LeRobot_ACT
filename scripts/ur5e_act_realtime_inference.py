@@ -6,6 +6,11 @@ Create one ``UR5eACTRealtimeInference`` instance in your UR5e control program,
 then call ``predict_next_tcp_pose`` with the latest two RGB camera frames and
 robot state. The method returns a 7D command:
 ``[x, y, z, rx, ry, rz, gripper_opening]``.
+
+The ACT action layout expected by this wrapper is:
+``[delta_tcp_x, delta_tcp_y, delta_tcp_z, delta_tcp_rx, delta_tcp_ry,
+delta_tcp_rz, gripper_target_opening]``. The gripper value is an absolute
+target opening, not a delta.
 """
 
 from __future__ import annotations
@@ -51,7 +56,10 @@ class UR5eACTRealtimeInference:
         rotation_delta_mode: str = "relative-rotvec",
         max_pos_delta: float | None = 0.015,
         max_rot_delta: float | None = 0.08,
-        max_gripper_delta: float | None = 0.08,
+        max_gripper_step: float | None = None,
+        max_gripper_delta: float | None = None,
+        gripper_min: float = 0.0,
+        gripper_max: float = 1.0,
         camera_keys: tuple[str, str] = (
             "observation.images.camera_1",
             "observation.images.camera_2",
@@ -69,7 +77,11 @@ class UR5eACTRealtimeInference:
                 default matches ``scripts/convert_ur5e_to_lerobot.py``.
             max_pos_delta: Optional safety clamp for dx/dy/dz in meters.
             max_rot_delta: Optional safety clamp for rotvec delta norm in radians.
-            max_gripper_delta: Optional safety clamp for gripper opening delta.
+            max_gripper_step: Optional safety clamp limiting the absolute
+                gripper target to current_opening +/- this value.
+            max_gripper_delta: Deprecated alias for max_gripper_step.
+            gripper_min: Lower bound for the absolute gripper target.
+            gripper_max: Upper bound for the absolute gripper target.
             camera_keys: LeRobot camera feature keys corresponding to the two
                 ndarray image inputs.
         """
@@ -78,12 +90,24 @@ class UR5eACTRealtimeInference:
             raise ValueError("inference_interval_s must be >= 0")
         if rotation_delta_mode not in {"relative-rotvec", "raw-rotvec"}:
             raise ValueError("rotation_delta_mode must be 'relative-rotvec' or 'raw-rotvec'")
+        if gripper_min >= gripper_max:
+            raise ValueError("gripper_min must be smaller than gripper_max")
+        if max_gripper_step is not None and max_gripper_step < 0:
+            raise ValueError("max_gripper_step must be >= 0")
+        if max_gripper_delta is not None:
+            if max_gripper_delta < 0:
+                raise ValueError("max_gripper_delta must be >= 0")
+            if max_gripper_step is not None:
+                raise ValueError("Use only one of max_gripper_step or max_gripper_delta")
+            max_gripper_step = max_gripper_delta
 
         self.inference_interval_s = float(inference_interval_s)
         self.rotation_delta_mode = rotation_delta_mode
         self.max_pos_delta = max_pos_delta
         self.max_rot_delta = max_rot_delta
-        self.max_gripper_delta = max_gripper_delta
+        self.max_gripper_step = max_gripper_step
+        self.gripper_min = gripper_min
+        self.gripper_max = gripper_max
         self.camera_keys = camera_keys
         self._last_inference_time: float | None = None
 
@@ -111,7 +135,8 @@ class UR5eACTRealtimeInference:
         Returns:
             Next command as ``np.ndarray`` with shape ``(7,)``:
             ``[x, y, z, rx, ry, rz, gripper_opening]``.
-            The gripper opening is clipped to ``[0, 1]``.
+            The gripper opening is the policy's absolute target opening,
+            clipped to ``[gripper_min, gripper_max]``.
         """
 
         self._wait_for_interval()
@@ -133,17 +158,13 @@ class UR5eACTRealtimeInference:
             action = self.postprocessor(normalized_action)
 
         action_np = np.asarray(action.squeeze(0), dtype=np.float64)
-        action_np = self._clamp_action(action_np)
+        action_np = self._clamp_action(action_np, gripper_opening_current[0])
         next_tcp_pose = apply_pose_delta(
             current_tcp_pose,
             action_np[:6],
             rotation_delta_mode=self.rotation_delta_mode,
         )
-        next_gripper_opening = np.clip(
-            gripper_opening_current[0] + action_np[6],
-            0.0,
-            1.0,
-        )
+        next_gripper_opening = action_np[6]
         self._last_inference_time = time.perf_counter()
         return np.asarray([*next_tcp_pose, next_gripper_opening], dtype=np.float64)
 
@@ -182,7 +203,7 @@ class UR5eACTRealtimeInference:
             batch[key] = _prepare_image(images[key], feature.shape)
         return batch
 
-    def _clamp_action(self, action: np.ndarray) -> np.ndarray:
+    def _clamp_action(self, action: np.ndarray, current_gripper_opening: float) -> np.ndarray:
         safe = np.asarray(action, dtype=np.float64).copy()
 
         if safe.shape[0] < 7:
@@ -196,8 +217,14 @@ class UR5eACTRealtimeInference:
             if rot_norm > self.max_rot_delta and rot_norm > 1e-12:
                 safe[3:6] *= self.max_rot_delta / rot_norm
 
-        if self.max_gripper_delta is not None:
-            safe[6] = np.clip(safe[6], -self.max_gripper_delta, self.max_gripper_delta)
+        safe[6] = np.clip(safe[6], self.gripper_min, self.gripper_max)
+        if self.max_gripper_step is not None:
+            safe[6] = np.clip(
+                safe[6],
+                current_gripper_opening - self.max_gripper_step,
+                current_gripper_opening + self.max_gripper_step,
+            )
+            safe[6] = np.clip(safe[6], self.gripper_min, self.gripper_max)
 
         return safe
 
