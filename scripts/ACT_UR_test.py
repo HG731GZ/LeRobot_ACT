@@ -39,7 +39,7 @@ while (UR_states is None) or (gripper_fb is None) or trycount < 50:
     time.sleep(0.1)
     trycount = trycount + 1
 
-GripperController.move(0.99, speed=20, accel=10, force=100)
+GripperController.move(0.99, speed=10, accel=20, force=80)
 print("开始ACT测试！")
 time.sleep(1)
 # 正式开始循环
@@ -67,10 +67,10 @@ while True:
         gripper,
     )
     URScriptClient.movel(next_tcp_pose[:6], a=0.1, v=0.1, frame='base_abs')
-    if next_tcp_pose[6] > 0.5:
-        next_tcp_pose[6] = 0.99
-    else:
-        next_tcp_pose[6] = 0.0
+    # if next_tcp_pose[6] > 0.5:
+    #     next_tcp_pose[6] = 0.99
+    # else:
+    #     next_tcp_pose[6] = 0.0
     GripperController.set_target_position(next_tcp_pose[6])
     print(f"{gripper_fb.current}|{next_tcp_pose[6]}")
 
