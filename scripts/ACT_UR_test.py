@@ -4,6 +4,7 @@ from UR_Utils.URRealtimeClient import URRealtimeClient
 from UR_Utils.URScriptClient import URScriptClient
 from UR_Utils.GripperController import GripperController
 from UR_Utils.RealSenseCamera import Camera
+from UR_Utils.URRTDEController import URRTDEController
 import scripts.ur_action_to_pose
 from scripts.ur5e_act_realtime_inference import UR5eACTRealtimeInference
 import time
@@ -15,7 +16,7 @@ CAMERA_FPS = 30  # 相机帧率
 URIP = '192.168.3.15'
 
 predictor = UR5eACTRealtimeInference(
-    policy_path="../outputs/train/ur5e_act_1660ti",
+    policy_path="../outputs/train/ur5e_act_a6000",
     device="cuda",
     inference_interval_s=0.1,
 )
@@ -26,6 +27,7 @@ Camera2 = Camera('d455', resolution=CAMERA_RESOLUTION, fps=CAMERA_FPS)
 
 URScriptClient = URScriptClient(URIP, auto_connect=True)
 URRealtimeClient = URRealtimeClient(URIP, auto_connect=True)
+URRTDEController = URRTDEController("192.168.3.15", 500.0, use_safety_check=False)
 GripperController = GripperController(port=URIP + f":{54321}", slave_id=1, connection_type="tcp", debug=False)
 GripperController.start(interval=0.05)
 
@@ -41,6 +43,7 @@ while (UR_states is None) or (gripper_fb is None) or trycount < 50:
 
 GripperController.move(0.99, speed=10, accel=20, force=80)
 print("开始ACT测试！")
+URRTDEController.start()
 time.sleep(1)
 # 正式开始循环
 while True:
@@ -66,7 +69,8 @@ while True:
         UR_tcp_pose,
         gripper,
     )
-    URScriptClient.movel(next_tcp_pose[:6], a=0.1, v=0.1, frame='base_abs')
+    # URScriptClient.movel(next_tcp_pose[:6], a=0.1, v=0.1, frame='base_abs')
+    URRTDEController.track_tcp_pose(next_tcp_pose[:6], v_max=0.1, w_max=0.05)
     # if next_tcp_pose[6] > 0.5:
     #     next_tcp_pose[6] = 0.99
     # else:
