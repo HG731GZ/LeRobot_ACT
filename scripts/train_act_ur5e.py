@@ -1,73 +1,76 @@
 #!/usr/bin/env python3
 """在 UR5e cylinder-to-box 数据集上训练 LeRobot ACT 策略。
 
-# ========== ACT（Action Chunking Transformer）简介 ==========
+# ========== ACT（Action Chunking with Transformers）简介 ==========
 #
-# ACT 是一种基于 Transformer 的模仿学习策略，专门用于机器人操作任务。
-# 它的核心思想是：给定一段观测序列（图像 + 关节状态），一次性预测未来
-# 多个时间步的动作（称为 action chunk），而不是逐步预测。
+# ACT 是一种面向机器人操作的模仿学习策略。它的核心思想是：给定当前观测
+# （通常是多路 RGB 图像 + 当前机器人本体状态），一次性预测未来多个时间步的
+# 动作序列，这段动作序列称为 action chunk。
 #
-# 为什么一次性预测多个动作？因为机器人执行动作时需要保持时间上的一致性，
-# 逐步预测容易导致抖动和误差累积。一次性预测一整段动作序列，能让模型
-# 学到更平滑、更协调的运动轨迹。
+# 在 LeRobot 当前实现中，ACT 默认 n_obs_steps=1，也就是输入当前时刻的观测，
+# 而不是显式输入一段历史观测序列。时间上的平滑性主要来自 action chunk、
+# action queue，以及可选的 temporal ensemble。
 #
-# ========== ACT 的 Transformer 架构 ==========
+# 为什么一次性预测多个动作？因为机器人执行需要短时间内连续、协调的动作。
+# 若每一步都独立预测，容易出现抖动和误差累积；预测一段动作可以让模型学到
+# 更平滑的局部轨迹。推理时通常只执行 chunk 中的前 n_action_steps 步，然后
+# 重新读取观测并预测下一段动作。
 #
-# ACT 使用了一个 **编码器-解码器（Encoder-Decoder）Transformer**，类似于
-# 机器翻译中的 seq2seq 模型：
+# ========== LeRobot ACT 的数据流 ==========
 #
-#   ┌──────────────────────────────────────────────────────────────────┐
-#   │                        ACT 架构总览                               │
-#   │                                                                  │
-#   │   观测（图像+状态）──► 编码器(Encoder) ──► 潜在向量 ──► 解码器(Decoder) ──► 动作序列
-#   │                         │                    │                      │
-#   │                    多层 self-attn      VAE 压缩/采样          cross-attn
-#   │                                                                  │
-#   └──────────────────────────────────────────────────────────────────┘
+#   当前观测 batch
+#     ├─ observation.images.* ─► ResNet18 backbone ─► feature map
+#     │                                             └► 1x1 Conv 投影
+#     │                                             └► 展平成视觉 token
+#     ├─ observation.state ─► Linear ─► 状态 token
+#     └─ 训练时 action chunk ─► VAE encoder ─► latent z；推理时 z = 0
 #
-# 1. **编码器 (Encoder)**：
-#    - 视觉主干 (vision backbone)：用预训练的 ResNet18 将摄像头图像转换为特征向量。
-#      每张图像经过 ResNet 卷积层后，变成一个固定长度的向量表示。
-#    - 状态嵌入：将机器人关节状态（如 TCP 坐标、夹爪开度）映射为向量。
-#    - Transformer 编码器层：用 **自注意力（Self-Attention）** 机制处理特征序列。
-#      自注意力的意思是：序列中的每个位置都会"关注"序列中所有其他位置，
-#      从而捕捉全局上下文信息。比如模型可以同时"看到"当前图像和关节状态，
-#      理解它们之间的关系。
-#    - VAE 编码器（可选）：将编码器输出压缩为一个低维潜在向量。
-#      VAE（变分自编码器）的作用是学习一个紧凑的、有意义的动作表示空间。
+#   [latent token, 状态 token, 视觉 tokens]
+#       └─► Transformer Encoder 融合观测信息
+#             └─► Transformer Decoder 使用 chunk_size 个可学习位置查询并行生成动作 token
+#                   └─► action_head 线性回归
+#                         └─► [B, chunk_size, action_dim]
 #
-# 2. **解码器 (Decoder)**：
-#    - 接收编码器产生的"记忆"（memory）和当前的动作查询（action query），
-#      通过**交叉注意力（Cross-Attention）** 机制，让解码器在生成每个动作时
-#      都能"回顾"编码器的观测记忆。
-#      Cross-Attention 与 Self-Attention 的区别：
-#        · Self-Attention：查询(Query)和键(Key)来自同一个序列（自己看自己）
-#        · Cross-Attention：查询来自解码器，键来自编码器（解码器看编码器输出）
-#    - 使用**因果注意力掩码（Causal Attention Mask）**，确保预测第 t 步动作时
-#      只能看到第 t 步之前的动作，不能"偷看"未来的动作。这保证了动作序列的
-#      自回归（autoregressive）生成顺序。
-#    - 输出一个长度为 chunk_size 的动作序列，每个动作包含 n_action_steps 步实际指令。
+# ========== ACT 的 Transformer / VAE 结构 ==========
+#
+# LeRobot 代码里容易混淆的三个模块：vae_encoder、encoder、decoder。
+#
+# 1. **视觉 backbone**：
+#    - 使用去掉分类头的 ResNet18。它不是做图像分类，也不输出类别概率。
+#    - ResNet 的 layer4 输出是一张低分辨率 feature map，例如 [B, C, H', W']。
+#    - 之后通过 1x1 Conv 映射到 dim_model，再把 H'×W' 个空间位置展平成视觉 token。
+#    - 因此每张图像不是变成一个固定长度分类向量，而是变成一串带空间位置的视觉 token。
+#
+# 2. **VAE encoder（仅训练时使用，且 use_vae=True 时启用）**：
+#    - 它不是把主 Transformer encoder 的输出再压缩。
+#    - 它单独接收 [CLS token, 当前机器人状态 token, 真实 action chunk tokens]，
+#      输出 latent 分布参数 μ 和 log(σ²)，并通过重参数化采样得到 z。
+#    - 这个 z 表示演示动作序列中的隐含变化模式。推理时没有真实 action chunk，
+#      因此 LeRobot 会直接令 z 为全 0。
+#
+# 3. **主 Transformer encoder / decoder**：
+#    - encoder 接收 latent token、状态 token、可选环境状态 token，以及所有视觉 token，
+#      通过 self-attention 融合这些观测信息。
+#    - decoder 的输入是长度为 chunk_size 的查询序列。它不是像语言模型那样
+#      自回归地一步步预测，也没有使用 causal mask 来禁止“看未来动作”。
+#      在 LeRobot ACT 中，decoder 用 self-attention 和 cross-attention 并行生成
+#      chunk_size 个动作 token。
+#    - 最后的 action_head 把每个动作 token 回归为一个 action 向量。
 #
 # ========== 关键超参数 ==========
 #
-# • dim_model：Transformer 中所有隐藏向量的维度。越大容量越大，但也越吃显存。
-# • n_heads：多头注意力（Multi-Head Attention）的头数。把 dim_model 分成 n_heads 份，
-#   每组独立计算注意力，最后拼接。多头让模型从不同角度理解输入关系。
-#   例如 dim_model=512, n_heads=8，则每个头处理 512/8=64 维的子空间。
-# • dim_feedforward：前馈网络（Feed-Forward Network, FFN）的隐藏层维度。
-#   每个 Transformer 层中，在注意力之后接一个两层 MLP，先升维再降维。
-#   通常设为 dim_model 的 4 倍左右。
-# • n_encoder_layers：编码器中 Transformer 层的数量。更深 → 更强的表示能力。
-# • n_decoder_layers：解码器中 Transformer 层的数量。
-# • n_vae_encoder_layers：VAE 编码器中 Transformer 层的数量，用于学习动作潜在空间。
-# • chunk_size：一次预测的动作序列长度（帧数）。例如 chunk_size=32 表示
-#   模型一次预测 32 帧的动作。
-# • n_action_steps：实际执行的动作步数（≤ chunk_size）。预测了 chunk_size 帧，
-#   但只执行前 n_action_steps 帧，然后重新预测。这就是"滚动预测"机制：
-#   执行一部分 → 重新观测 → 再预测 → 再执行。
-# • kl_weight：VAE 的 KL 散度损失权重。KL 散度衡量潜在分布与标准正态分布的差异。
-#   权重越大，潜在空间越接近正态分布（更规整但可能丢失信息）；越小则重构越精确
-#   （但潜在空间可能不连续）。
+# • dim_model：Transformer 中 token 的隐藏维度。视觉 token、状态 token、latent token
+#   最终都会被投影到这个维度。
+# • n_heads：多头注意力的头数。dim_model 必须能被 n_heads 整除。
+# • dim_feedforward：Transformer 层中 FFN 的中间层维度，通常大于 dim_model。
+# • n_encoder_layers：主 Transformer encoder 层数，用于融合视觉、状态和 latent token。
+# • n_decoder_layers：Transformer decoder 层数。LeRobot 默认保持为 1，以匹配原 ACT 实现行为。
+# • n_vae_encoder_layers：VAE encoder 的层数；它是独立的动作序列编码器，不是主 encoder 的附加层。
+# • chunk_size：模型一次预测的动作序列长度，即输出 [B, chunk_size, action_dim]。
+# • n_action_steps：不使用 temporal ensemble 时，一次 forward 后实际放入 action queue 并执行的动作数。
+#   它必须 ≤ chunk_size。例如 chunk_size=64、n_action_steps=32 表示预测 64 帧，先执行前 32 帧，
+#   然后重新观测并预测下一段。
+# • kl_weight：VAE KL 散度损失权重。总损失为动作重构损失 + kl_weight × KL 损失。
 #
 # ========== 训练流程 ==========
 #
@@ -126,9 +129,9 @@ class TrainPreset:
     - dim_feedforward: 前馈网络的中间层维度
     - n_encoder_layers: 编码器 Transformer 层数
     - n_decoder_layers: 解码器 Transformer 层数
-    - n_vae_encoder_layers: VAE 编码器的 Transformer 层数
-    - chunk_size: 一次预测的动作块大小（帧数）
-    - n_action_steps: 实际执行的动作步数
+    - n_vae_encoder_layers: VAE encoder 自身的 Transformer 层数
+    - chunk_size: 一次 forward 预测的动作块大小（帧数）
+    - n_action_steps: 不使用 temporal ensemble 时每次预测后放入执行队列的动作步数
     """
     batch_size: int
     num_workers: int
@@ -170,7 +173,7 @@ PRESETS: dict[str, TrainPreset] = {
     ),
     # A6000 显存余量大（48GB），可以更接近 LeRobot ACT 默认容量。
     # Transformer 使用更大容量：dim_model=512（隐藏维度512），n_heads=8（8个注意力头，每个头64维），
-    # encoder 4层，VAE encoder 4层，能学到更丰富的特征表示。
+    # 主 encoder 4层，VAE encoder 4层，能学习更丰富的观测-动作表示。
     "a6000": TrainPreset(
         batch_size=8,
         num_workers=8,
@@ -254,7 +257,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--chunk-size", type=int, default=None,
                         help="一次预测的动作块大小（帧数）")
     parser.add_argument("--n-action-steps", type=int, default=None,
-                        help="实际执行的动作步数（≤ chunk_size）")
+                        help="不使用 temporal ensemble 时，每次预测后实际执行/入队的动作步数（≤ chunk_size）")
     parser.add_argument("--dim-model", type=int, default=None,
                         help="Transformer 隐藏层维度")
     parser.add_argument("--n-heads", type=int, default=None,
@@ -282,7 +285,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=None,
                         help="是否使用自动混合精度训练（节省显存）")
     parser.add_argument("--use-vae", action=argparse.BooleanOptionalAction, default=True,
-                        help="是否使用 VAE 变分自编码器学习动作潜在空间")
+                        help="是否使用 VAE 变分目标；训练时额外编码真实 action chunk 得到 latent z")
     parser.add_argument(
         "--pretrained-backbone",
         action=argparse.BooleanOptionalAction,
@@ -376,12 +379,13 @@ def build_config(args: argparse.Namespace, preset_name: str, preset: TrainPreset
             use_amp=choose(args.use_amp, preset.use_amp),
             push_to_hub=False,
             # == 动作分块参数 ==
-            # chunk_size: Transformer 解码器一次性输出的动作序列长度
-            # n_action_steps: 实际执行前多少步，然后重新预测（滚动预测）
+            # chunk_size: 模型一次 forward 输出的动作序列长度，输出形状为 [B, chunk_size, action_dim]
+            # n_action_steps: 不使用 temporal ensemble 时，每次预测后实际放入 action queue 执行的步数
             chunk_size=choose(args.chunk_size, preset.chunk_size),
             n_action_steps=choose(args.n_action_steps, preset.n_action_steps),
             # == 视觉 backbone ==
-            # ResNet18 将图像编码为特征向量，作为 Transformer 编码器的输入
+            # ResNet18 去掉分类头后作为特征提取器，输出 layer4 feature map；
+            # LeRobot 随后用 1x1 Conv 投影并展平成视觉 tokens 输入 Transformer 编码器
             vision_backbone="resnet18",
             pretrained_backbone_weights=pretrained_backbone_weights,
             # == Transformer 结构参数 ==
@@ -396,16 +400,16 @@ def build_config(args: argparse.Namespace, preset_name: str, preset: TrainPreset
             # n_decoder_layers: 解码器堆叠的 Transformer 层数
             n_decoder_layers=choose(args.n_decoder_layers, preset.n_decoder_layers),
             # == VAE（变分自编码器）参数 ==
-            # use_vae: 是否在编码器后使用 VAE。VAE 将编码器输出映射到一个概率分布
-            #   （均值 μ 和方差 σ²），从中采样潜在向量 z。
-            #   这样做的好处：(1) 潜在空间更平滑连续 (2) 有助于生成多样化的动作
-            #   (3) KL 散度约束防止过拟合
+            # use_vae: 是否使用“变分目标”。启用后会额外建立一个 VAE encoder，
+            #   训练时把 [CLS, 当前机器人状态, 真实 action chunk] 编码成 latent 分布，
+            #   得到 μ 和 log(σ²)，再采样 latent z 供主 Transformer 使用。
+            #   推理时没有真实 action chunk，因此 z 直接置为 0。
             use_vae=args.use_vae,
-            # latent_dim: 潜在向量 z 的维度。编码器输出被压缩到这个维度
+            # latent_dim: latent z 的维度，不是主 encoder 输出维度，而是 VAE encoder 输出的隐变量维度
             latent_dim=args.latent_dim,
-            # n_vae_encoder_layers: VAE 编码器中额外的 Transformer 层数
-            #   VAE 编码器在主干编码器之上再堆叠几层 Transformer，
-            #   然后分别输出 μ 和 log(σ²)，用于构造潜在分布 N(μ, σ²)
+            # n_vae_encoder_layers: VAE encoder 自身的 Transformer 层数。
+            #   它是独立的动作序列编码器，不是在主 Transformer encoder 后面继续堆叠。
+            #   输出的 μ 和 log(σ²) 用于构造潜在分布 N(μ, σ²)
             n_vae_encoder_layers=choose(args.n_vae_encoder_layers, preset.n_vae_encoder_layers),
             # == 正则化与优化参数 ==
             # dropout: 训练时随机"丢弃"一部分神经元，防止过拟合
